@@ -8,7 +8,7 @@ import secrets
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Awaitable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -19,6 +19,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -26,20 +27,17 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-try:
-    from pymongo import MongoClient
-    MONGO_AVAILABLE = True
-except ImportError:
-    MONGO_AVAILABLE = False
+# ── Configuration & Persistent Paths ────────────────────────────────
+BOT_TOKEN  = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+OWNER_ID   = int(os.getenv("OWNER_ID", "123456789"))  # Your numeric Telegram ID
 
-# ── Configuration ───────────────────────────────────────────────────
-BOT_TOKEN  = os.getenv("BOT_TOKEN", "9172966238:AAGv6OZsLaO_BwabWunPGlvxgGHpnUDs4Xg")
-MONGO_URI  = os.getenv("MONGO_URI", "")  # e.g. "mongodb+srv://user:pass@cluster.mongodb.net/"
-OWNER_ID   = int(os.getenv("OWNER_ID", "5541778617"))  # Replace with your Telegram User ID
+# Set DATA_DIR="/data" in Railway Variables when using a Volume, or leave unset for local "."
+DATA_DIR   = os.getenv("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-CACHE_FILE = "service_cache.json"
-PROXY_FILE = "proxies.txt"
-JSON_DB    = "auth_db.json"
+CACHE_FILE = os.path.join(DATA_DIR, "service_cache.json")
+JSON_DB    = os.path.join(DATA_DIR, "auth_db.json")
+PROXY_FILE = os.path.join(DATA_DIR, "proxies.txt")
 
 _M = "https://morethanpanel.com"
 _T = "https://tgpanel.org"
@@ -75,40 +73,28 @@ PLATFORMS: Dict[str, Tuple[str, List[int]]] = {
     "tg": ("✈️ Telegram",  [10, 11, 12]),
 }
 
-# ── Hybrid Database Engine (MongoDB + JSON Fallback) ────────────────
+# ── Self-Healing JSON Database Engine ───────────────────────────────
 class AuthDB:
-    def __init__(self, mongo_uri: str, json_path: str):
-        self.use_mongo = False
+    def __init__(self, json_path: str):
         self.json_path = json_path
         self.lock = threading.Lock()
-
-        if mongo_uri and MONGO_AVAILABLE:
-            try:
-                self.client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-                self.client.admin.command("ping")
-                self.db = self.client["smm_booster_db"]
-                self.users = self.db["users"]
-                self.keys = self.db["keys"]
-                self.use_mongo = True
-                logging.info("Connected to MongoDB Atlas successfully.")
-            except Exception as e:
-                logging.warning(f"MongoDB connection failed ({e}). Falling back to local JSON.")
-
-        if not self.use_mongo:
-            self._init_json()
-
-    def _init_json(self):
-        if not os.path.exists(self.json_path):
-            with open(self.json_path, "w") as f:
-                json.dump({"users": {}, "keys": {}}, f, indent=2)
+        self._write_json(self._read_json())
 
     def _read_json(self) -> dict:
         with self.lock:
             try:
-                with open(self.json_path, "r") as f:
-                    return json.load(f)
+                if os.path.exists(self.json_path):
+                    with open(self.json_path, "r") as f:
+                        data = json.load(f)
+                    if not isinstance(data, dict):
+                        data = {}
+                else:
+                    data = {}
             except Exception:
-                return {"users": {}, "keys": {}}
+                data = {}
+            data.setdefault("users", {})
+            data.setdefault("keys", {})
+            return data
 
     def _write_json(self, data: dict):
         with self.lock:
@@ -120,129 +106,83 @@ class AuthDB:
         default_role = "OWNER" if user_id == OWNER_ID else "FREE"
         default_exp = 9999999999 if user_id == OWNER_ID else 0
 
-        if self.use_mongo:
-            u = self.users.find_one({"user_id": user_id})
-            if not u:
-                u = {
-                    "user_id": user_id,
-                    "username": username,
-                    "role": default_role,
-                    "expires_at": default_exp,
-                    "joined_at": now,
-                }
-                self.users.insert_one(u)
-            elif user_id == OWNER_ID and u.get("role") != "OWNER":
-                self.users.update_one({"user_id": user_id}, {"$set": {"role": "OWNER", "expires_at": default_exp}})
-                u["role"] = "OWNER"
-            return u
-        else:
-            data = self._read_json()
-            uid_str = str(user_id)
-            if uid_str not in data["users"]:
-                data["users"][uid_str] = {
-                    "user_id": user_id,
-                    "username": username,
-                    "role": default_role,
-                    "expires_at": default_exp,
-                    "joined_at": now,
-                }
-                self._write_json(data)
-            elif user_id == OWNER_ID and data["users"][uid_str].get("role") != "OWNER":
-                data["users"][uid_str]["role"] = "OWNER"
-                data["users"][uid_str]["expires_at"] = default_exp
-                self._write_json(data)
-            return data["users"][uid_str]
+        data = self._read_json()
+        uid_str = str(user_id)
+        if uid_str not in data["users"]:
+            data["users"][uid_str] = {
+                "user_id": user_id,
+                "username": username,
+                "role": default_role,
+                "expires_at": default_exp,
+                "joined_at": now,
+            }
+            self._write_json(data)
+        elif user_id == OWNER_ID and data["users"][uid_str].get("role") != "OWNER":
+            data["users"][uid_str]["role"] = "OWNER"
+            data["users"][uid_str]["expires_at"] = default_exp
+            self._write_json(data)
+        return data["users"][uid_str]
 
     def set_role(self, user_id: int, role: str, duration_sec: int = 0):
         exp = int(time.time()) + duration_sec if duration_sec > 0 else (9999999999 if role in ("OWNER", "ADMIN") else 0)
-        if self.use_mongo:
-            self.users.update_one(
-                {"user_id": user_id},
-                {"$set": {"role": role, "expires_at": exp}},
-                upsert=True,
-            )
-        else:
-            data = self._read_json()
-            uid_str = str(user_id)
-            u = data["users"].get(uid_str, {"user_id": user_id, "joined_at": int(time.time())})
-            u["role"] = role
-            u["expires_at"] = exp
-            data["users"][uid_str] = u
-            self._write_json(data)
+        data = self._read_json()
+        uid_str = str(user_id)
+        u = data["users"].get(uid_str, {"user_id": user_id, "joined_at": int(time.time())})
+        u["role"] = role
+        u["expires_at"] = exp
+        data["users"][uid_str] = u
+        self._write_json(data)
 
     def create_key(self, duration_sec: int, label: str, created_by: int) -> str:
         code = f"BOOST-{secrets.token_hex(3).upper()}-{secrets.token_hex(3).upper()}"
-        key_doc = {
+        data = self._read_json()
+        data["keys"][code] = {
             "code": code,
             "duration_sec": duration_sec,
             "label": label,
             "created_by": created_by,
             "created_at": int(time.time()),
         }
-        if self.use_mongo:
-            self.keys.insert_one(key_doc)
-        else:
-            data = self._read_json()
-            data["keys"][code] = key_doc
-            self._write_json(data)
+        self._write_json(data)
         return code
 
     def redeem_key(self, user_id: int, code: str) -> Tuple[bool, str]:
         code = code.strip().upper()
         now = int(time.time())
+        data = self._read_json()
 
-        if self.use_mongo:
-            key_doc = self.keys.find_one_and_delete({"code": code})
-        else:
-            data = self._read_json()
-            key_doc = data["keys"].pop(code, None)
-            if key_doc:
-                self._write_json(data)
-
+        key_doc = data["keys"].pop(code, None)
         if not key_doc:
             return False, "Invalid or already redeemed key."
 
-        u = self.get_user(user_id)
+        uid_str = str(user_id)
+        u = data["users"].get(uid_str) or self.get_user(user_id)
         current_exp = u.get("expires_at", 0)
         base_time = max(now, current_exp) if u.get("role") == "PREMIUM" else now
         new_exp = base_time + key_doc["duration_sec"]
 
         new_role = u["role"] if u["role"] in ("OWNER", "ADMIN") else "PREMIUM"
-        if self.use_mongo:
-            self.users.update_one(
-                {"user_id": user_id},
-                {"$set": {"role": new_role, "expires_at": new_exp}},
-            )
-        else:
-            data = self._read_json()
-            data["users"][str(user_id)]["role"] = new_role
-            data["users"][str(user_id)]["expires_at"] = new_exp
-            self._write_json(data)
+        data["users"][uid_str]["role"] = new_role
+        data["users"][uid_str]["expires_at"] = new_exp
+        self._write_json(data)
 
         exp_str = datetime.fromtimestamp(new_exp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         return True, f"Key redeemed ({key_doc['label']})! Valid until: {exp_str}"
 
     def cleanup_expired(self) -> int:
         now = int(time.time())
-        if self.use_mongo:
-            res = self.users.update_many(
-                {"role": "PREMIUM", "expires_at": {"$lt": now}},
-                {"$set": {"role": "FREE", "expires_at": 0}},
-            )
-            return res.modified_count
-        else:
-            data = self._read_json()
-            count = 0
-            for uid, u in data["users"].items():
-                if u.get("role") == "PREMIUM" and u.get("expires_at", 0) < now:
-                    u["role"] = "FREE"
-                    u["expires_at"] = 0
-                    count += 1
-            if count > 0:
-                self._write_json(data)
-            return count
+        data = self._read_json()
+        count = 0
+        for uid, u in data["users"].items():
+            if u.get("role") == "PREMIUM" and u.get("expires_at", 0) < now:
+                u["role"] = "FREE"
+                u["expires_at"] = 0
+                count += 1
+        if count > 0:
+            self._write_json(data)
+        return count
 
-db = AuthDB(MONGO_URI, JSON_DB)
+db = AuthDB(JSON_DB)
 
 # ── Background Expiry Monitor Thread ────────────────────────────────
 def start_expiry_daemon():
@@ -256,12 +196,10 @@ def start_expiry_daemon():
                 logging.error(f"[ExpiryDaemon] Error: {e}")
             time.sleep(60)
 
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
+    threading.Thread(target=_worker, daemon=True).start()
 
-# ── Duration Parser Helper ──────────────────────────────────────────
+# ── Helpers: Cache, Proxies & Auth ──────────────────────────────────
 def parse_duration(dur_str: str) -> Optional[Tuple[int, str]]:
-    """Parses strings like '30m', '12h', '7d' into (seconds, label)."""
     m = re.match(r"^(\d+)([mhd])$", dur_str.strip().lower())
     if not m:
         return None
@@ -273,42 +211,15 @@ def is_authorized(user_doc: dict) -> bool:
     role = user_doc.get("role", "FREE")
     if role in ("OWNER", "ADMIN"):
         return True
-    if role == "PREMIUM" and user_doc.get("expires_at", 0) > int(time.time()):
-        return True
-    return False
-
-# ── Aiogram Auth Middleware ─────────────────────────────────────────
-class RoleAuthMiddleware(BaseMiddleware):
-    async def __call__(
-        self,
-        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
-        event: TelegramObject,
-        data: Dict[str, Any],
-    ) -> Any:
-        user = data.get("event_from_user")
-        if not user:
-            return await handler(event, data)
-
-        user_doc = db.get_user(user.id, user.username or "")
-        # Real-time expiry check before handling event
-        if user_doc.get("role") == "PREMIUM" and user_doc.get("expires_at", 0) <= int(time.time()):
-            db.set_role(user.id, "FREE", 0)
-            user_doc["role"] = "FREE"
-            user_doc["expires_at"] = 0
-
-        data["user_doc"] = user_doc
-        return await handler(event, data)
-
-# ── State & File Helpers ────────────────────────────────────────────
-class OrderState(StatesGroup):
-    waiting_for_link = State()
-    waiting_for_key = State()
+    return role == "PREMIUM" and user_doc.get("expires_at", 0) > int(time.time())
 
 def load_cache() -> Dict[str, str]:
     if os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+            if isinstance(data, dict) and data:
+                return data
         except Exception:
             pass
     cache = {slug: pid for _, _, slug, _, pid in SERVICES if pid}
@@ -323,11 +234,66 @@ def save_cache(cache: Dict[str, str]) -> None:
         pass
 
 def load_proxies() -> List[str]:
-    if not os.path.exists(PROXY_FILE):
+    target = PROXY_FILE if os.path.exists(PROXY_FILE) else ("proxies.txt" if os.path.exists("proxies.txt") else None)
+    if not target:
         return []
-    with open(PROXY_FILE, "r") as f:
-        lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-    return [p if "://" in p else f"http://{p}" for p in lines]
+    try:
+        with open(target, "r") as f:
+            lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+        return [p if "://" in p else f"http://{p}" for p in lines]
+    except Exception:
+        return []
+
+def update_proxies_storage(raw_text: str, append: bool = True) -> Tuple[int, int]:
+    new_lines = [
+        line.strip()
+        for line in raw_text.splitlines()
+        if line.strip() and not line.strip().startswith("#") and ":" in line
+    ]
+    existing = []
+    if append and os.path.exists(PROXY_FILE):
+        try:
+            with open(PROXY_FILE, "r") as f:
+                existing = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+        except Exception:
+            existing = []
+
+    combined = list(dict.fromkeys(existing + new_lines))
+    with open(PROXY_FILE, "w") as f:
+        f.write("\n".join(combined) + ("\n" if combined else ""))
+
+    added = len(combined) - len(existing) if append else len(combined)
+    return max(0, added), len(combined)
+
+async def check_and_prune_proxies(proxies: List[str], concurrency: int = 25) -> Tuple[List[str], int]:
+    sem = asyncio.Semaphore(concurrency)
+    alive_with_ping: List[Tuple[float, str]] = []
+
+    async def _test(px: str):
+        async with sem:
+            t0 = time.monotonic()
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        "http://httpbin.org/ip",
+                        proxy=px,
+                        timeout=aiohttp.ClientTimeout(total=8),
+                    ) as resp:
+                        if resp.status == 200:
+                            ping = time.monotonic() - t0
+                            alive_with_ping.append((ping, px))
+            except Exception:
+                pass
+
+    await asyncio.gather(*(_test(p) for p in proxies))
+    alive_with_ping.sort(key=lambda x: x[0])
+    alive_proxies = [px for _, px in alive_with_ping]
+    dead_count = len(proxies) - len(alive_proxies)
+
+    with open(PROXY_FILE, "w") as f:
+        f.write("\n".join(alive_proxies) + ("\n" if alive_proxies else ""))
+
+    return alive_proxies, dead_count
 
 def normalize_link(link: str) -> str:
     link = link.strip()
@@ -336,6 +302,32 @@ def normalize_link(link: str) -> str:
     if ("instagram.com/" in link or "t.me/" in link) and "?" in link:
         link = link.split("?")[0]
     return link
+
+# ── Middleware & States ─────────────────────────────────────────────
+class RoleAuthMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        user = data.get("event_from_user")
+        if not user:
+            return await handler(event, data)
+
+        user_doc = db.get_user(user.id, user.username or "")
+        if user_doc.get("role") == "PREMIUM" and user_doc.get("expires_at", 0) <= int(time.time()):
+            db.set_role(user.id, "FREE", 0)
+            user_doc["role"] = "FREE"
+            user_doc["expires_at"] = 0
+
+        data["user_doc"] = user_doc
+        return await handler(event, data)
+
+class OrderState(StatesGroup):
+    waiting_for_link = State()
+    waiting_for_key = State()
+    waiting_for_proxies = State()
 
 # ── Async Network Engine ────────────────────────────────────────────
 async def fetch_service_id(
@@ -429,6 +421,8 @@ def main_menu_kb(user_doc: dict) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="👤 My Plan", callback_data="action:profile"),
         InlineKeyboardButton(text="🔎 Refresh IDs", callback_data="action:scan"),
     )
+    if user_doc.get("role") in ("OWNER", "ADMIN"):
+        builder.row(InlineKeyboardButton(text="🌐 Manage Proxies", callback_data="action:proxies"))
     return builder.as_markup()
 
 def platform_menu_kb(plat_key: str, cache: Dict[str, str]) -> InlineKeyboardMarkup:
@@ -442,6 +436,21 @@ def platform_menu_kb(plat_key: str, cache: Dict[str, str]) -> InlineKeyboardMark
     builder.adjust(1)
     builder.row(InlineKeyboardButton(text="⬅️ Back to Main Menu", callback_data="action:home"))
     return builder.as_markup()
+
+def proxy_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="➕ Append Proxies", callback_data="px:append"),
+                InlineKeyboardButton(text="🔄 Replace All", callback_data="px:replace"),
+            ],
+            [
+                InlineKeyboardButton(text="⚡ Test & Clean Dead", callback_data="px:check"),
+                InlineKeyboardButton(text="🗑️ Clear All", callback_data="px:clear"),
+            ],
+            [InlineKeyboardButton(text="⬅️ Back to Main Menu", callback_data="action:home")],
+        ]
+    )
 
 def cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -462,7 +471,6 @@ def get_dashboard_text(user_doc: dict, proxies: List[str], cache: Dict[str, str]
     else:
         exp_str = "Expired / None"
 
-    db_mode = "MongoDB Atlas" if db.use_mongo else "Local JSON"
     auth_banner = (
         "👇 <i>Select a platform below to boost:</i>"
         if is_authorized(user_doc)
@@ -473,7 +481,7 @@ def get_dashboard_text(user_doc: dict, proxies: List[str], cache: Dict[str, str]
         "🚀 <b>ALL-IN-ONE SOCIAL BOOSTER BOT</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 <b>Role:</b> <code>{role}</code> ({exp_str})\n"
-        f"🗄 <b>Storage:</b> <code>{db_mode}</code>\n"
+        f"🗄 <b>Storage:</b> <code>Local JSON ({DATA_DIR})</code>\n"
         f"🌐 <b>Proxies:</b> <code>{len(proxies)}</code> │ 🗂 <b>IDs:</b> <code>{len(cache)}/{len(SERVICES)}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{auth_banner}"
@@ -487,7 +495,7 @@ async def cmd_start(message: Message, state: FSMContext, user_doc: dict):
         reply_markup=main_menu_kb(user_doc),
     )
 
-# ── Key & Admin Commands ────────────────────────────────────────────
+# ── Key, Backup & Admin Commands ────────────────────────────────────
 @router.message(Command("genkey"))
 async def cmd_genkey(message: Message, command: CommandObject, user_doc: dict):
     if user_doc.get("role") not in ("OWNER", "ADMIN"):
@@ -549,7 +557,189 @@ async def cmd_revoke(message: Message, command: CommandObject, user_doc: dict):
     db.set_role(target_id, "FREE", 0)
     await message.answer(f"✅ User <code>{target_id}</code> downgraded to <b>FREE</b>.")
 
-# ── Callback Handlers ───────────────────────────────────────────────
+@router.message(Command("backup"))
+async def cmd_backup(message: Message, user_doc: dict):
+    if user_doc.get("role") != "OWNER":
+        return
+    for filepath in (JSON_DB, CACHE_FILE, PROXY_FILE):
+        if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+            await message.answer_document(FSInputFile(filepath))
+    await message.answer("✅ <b>Backup files exported.</b>")
+
+# ── Proxy Management Commands & Upload Handlers ─────────────────────
+@router.message(Command("addproxies"))
+async def cmd_addproxies(message: Message, command: CommandObject, state: FSMContext, user_doc: dict):
+    if user_doc.get("role") not in ("OWNER", "ADMIN"):
+        return
+    if command.args:
+        added, total = update_proxies_storage(command.args, append=True)
+        await message.answer(f"✅ Added <code>{added}</code> new proxies! Total active: <code>{total}</code>")
+    else:
+        await state.update_data(proxy_mode="append")
+        await state.set_state(OrderState.waiting_for_proxies)
+        await message.answer(
+            "➕ <b>Send proxies to APPEND</b> (one per line, e.g. <code>ip:port</code> or <code>http://user:pass@ip:port</code>), or upload a <code>.txt</code> file:",
+            reply_markup=cancel_kb(),
+        )
+
+@router.message(Command("setproxies"))
+async def cmd_setproxies(message: Message, command: CommandObject, state: FSMContext, user_doc: dict):
+    if user_doc.get("role") not in ("OWNER", "ADMIN"):
+        return
+    if command.args:
+        added, total = update_proxies_storage(command.args, append=False)
+        await message.answer(f"🔄 Replaced proxy list! Total active: <code>{total}</code>")
+    else:
+        await state.update_data(proxy_mode="replace")
+        await state.set_state(OrderState.waiting_for_proxies)
+        await message.answer(
+            "🔄 <b>Send proxies to REPLACE existing list</b> (one per line) or upload a <code>.txt</code> file:",
+            reply_markup=cancel_kb(),
+        )
+
+@router.message(Command("clearproxies"))
+async def cmd_clearproxies(message: Message, user_doc: dict):
+    if user_doc.get("role") not in ("OWNER", "ADMIN"):
+        return
+    update_proxies_storage("", append=False)
+    await message.answer("🗑️ <b>All proxies cleared.</b>")
+
+@router.message(Command("checkproxies"))
+async def cmd_checkproxies(message: Message, user_doc: dict):
+    if user_doc.get("role") not in ("OWNER", "ADMIN"):
+        return
+    proxies = load_proxies()
+    if not proxies:
+        await message.answer("⚠️ <b>No proxies loaded to test!</b>")
+        return
+
+    status_msg = await message.answer(
+        f"⚡ <b>Testing <code>{len(proxies)}</code> proxies concurrently...</b>\n"
+        "<i>Checking connectivity & pruning dead nodes (max 8s timeout)...</i>"
+    )
+    alive, dead_count = await check_and_prune_proxies(proxies)
+    await status_msg.edit_text(
+        "🧹 <b>PROXY CHECK COMPLETE</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ <b>Alive (Sorted by Speed):</b> <code>{len(alive)}</code>\n"
+        f"💀 <b>Dead (Removed):</b> <code>{dead_count}</code>",
+        reply_markup=proxy_menu_kb(),
+    )
+
+@router.message(Command("proxies"))
+async def cmd_proxies(message: Message, user_doc: dict):
+    if user_doc.get("role") not in ("OWNER", "ADMIN"):
+        return
+    proxies = load_proxies()
+    preview = "\n".join(f"<code>{p}</code>" for p in proxies[:10]) if proxies else "<i>No proxies loaded.</i>"
+    extra = f"\n<i>...and {len(proxies) - 10} more.</i>" if len(proxies) > 10 else ""
+    await message.answer(
+        f"🌐 <b>PROXY MANAGER</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Total Loaded:</b> <code>{len(proxies)}</code>\n\n"
+        f"{preview}{extra}",
+        reply_markup=proxy_menu_kb(),
+    )
+
+@router.callback_query(F.data == "action:proxies")
+async def cb_proxies_menu(call: CallbackQuery, user_doc: dict):
+    if user_doc.get("role") not in ("OWNER", "ADMIN"):
+        await call.answer("⛔ Admin only!", show_alert=True)
+        return
+    proxies = load_proxies()
+    preview = "\n".join(f"<code>{p}</code>" for p in proxies[:10]) if proxies else "<i>No proxies loaded.</i>"
+    extra = f"\n<i>...and {len(proxies) - 10} more.</i>" if len(proxies) > 10 else ""
+    await call.message.edit_text(
+        f"🌐 <b>PROXY MANAGER</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Total Loaded:</b> <code>{len(proxies)}</code>\n\n"
+        f"{preview}{extra}",
+        reply_markup=proxy_menu_kb(),
+    )
+    await call.answer()
+
+@router.callback_query(F.data.startswith("px:"))
+async def cb_proxy_actions(call: CallbackQuery, state: FSMContext, user_doc: dict):
+    if user_doc.get("role") not in ("OWNER", "ADMIN"):
+        await call.answer("⛔ Admin only!", show_alert=True)
+        return
+    act = call.data.split(":")[1]
+    if act == "clear":
+        update_proxies_storage("", append=False)
+        await call.message.edit_text(
+            "🗑️ <b>All proxies have been cleared!</b>",
+            reply_markup=main_menu_kb(user_doc),
+        )
+    elif act == "check":
+        proxies = load_proxies()
+        if not proxies:
+            await call.answer("⚠️ No proxies loaded to test!", show_alert=True)
+            return
+        await call.answer("Testing proxies...")
+        await call.message.edit_text(
+            f"⚡ <b>Testing <code>{len(proxies)}</code> proxies concurrently...</b>\n"
+            "<i>Checking connectivity & pruning dead nodes (max 8s timeout)...</i>"
+        )
+        alive, dead_count = await check_and_prune_proxies(proxies)
+        await call.message.edit_text(
+            "🧹 <b>PROXY CHECK COMPLETE</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ <b>Alive (Sorted by Speed):</b> <code>{len(alive)}</code>\n"
+            f"💀 <b>Dead (Removed):</b> <code>{dead_count}</code>",
+            reply_markup=proxy_menu_kb(),
+        )
+        return
+    elif act in ("append", "replace"):
+        await state.update_data(proxy_mode=act)
+        await state.set_state(OrderState.waiting_for_proxies)
+        mode_label = "APPEND to" if act == "append" else "REPLACE"
+        await call.message.edit_text(
+            f"🌐 <b>Send proxies to {mode_label} your list:</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "• Paste proxies as text (one per line)\n"
+            "• Or upload a <code>.txt</code> document directly",
+            reply_markup=cancel_kb(),
+        )
+    await call.answer()
+
+@router.message(OrderState.waiting_for_proxies, F.document)
+async def process_proxy_document(message: Message, state: FSMContext, bot: Bot, user_doc: dict):
+    data = await state.get_data()
+    append = data.get("proxy_mode", "append") == "append"
+    await state.clear()
+
+    doc = message.document
+    if not doc.file_name.endswith(".txt"):
+        await message.answer("⚠️ Please upload a valid <code>.txt</code> file.", reply_markup=main_menu_kb(user_doc))
+        return
+
+    file_info = await bot.get_file(doc.file_id)
+    downloaded = await bot.download_file(file_info.file_path)
+    raw_text = downloaded.read().decode("utf-8", errors="ignore")
+
+    added, total = update_proxies_storage(raw_text, append=append)
+    action_word = "Appended" if append else "Loaded"
+    await message.answer(
+        f"✅ <b>{action_word} {added} proxies from file!</b>\n"
+        f"🌐 <b>Total Active Proxies:</b> <code>{total}</code>",
+        reply_markup=main_menu_kb(user_doc),
+    )
+
+@router.message(OrderState.waiting_for_proxies, F.text)
+async def process_proxy_text(message: Message, state: FSMContext, user_doc: dict):
+    data = await state.get_data()
+    append = data.get("proxy_mode", "append") == "append"
+    await state.clear()
+
+    added, total = update_proxies_storage(message.text, append=append)
+    action_word = "Appended" if append else "Loaded"
+    await message.answer(
+        f"✅ <b>{action_word} {added} proxies!</b>\n"
+        f"🌐 <b>Total Active Proxies:</b> <code>{total}</code>",
+        reply_markup=main_menu_kb(user_doc),
+    )
+
+# ── Standard Callback & Order Handlers ──────────────────────────────
 @router.callback_query(F.data == "action:home")
 async def cb_home(call: CallbackQuery, state: FSMContext, user_doc: dict):
     await state.clear()
